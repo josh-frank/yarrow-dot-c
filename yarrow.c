@@ -3,10 +3,23 @@
  *
  * Faithful-but-modernized C port of Freenet's Yarrow-160 (Scott G. Miller).
  * See yarrow.h for full design notes.
+ *
+ * Nonce-counter fix (see yarrow.h for rationale):
+ *   The original code stored both the ChaCha20 nonce and block-counter in a
+ *   single 16-byte `counter[]` array, and reset it on every rekey.  This
+ *   could produce (nonce, key) collisions at rekey boundaries.
+ *
+ *   This version keeps them separate:
+ *     - y->nonce[8]       set once from OS entropy at init; never modified.
+ *     - y->block_counter  uint64_t; incremented before every ChaCha20 call
+ *                         and never reset, even across rekeys.
+ *
+ *   Every call to chacha20_block() is therefore:
+ *     crypto_stream_chacha20_xor_ic(out, in, len, nonce, block_counter, key)
+ *   guaranteeing a unique (nonce, IC) pair for every block ever produced.
  */
 
 #include "yarrow.h"
-
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -18,7 +31,7 @@
 static void fast_pool_reseed(yarrow_t *y);
 static void slow_pool_reseed(yarrow_t *y);
 static void rekey(yarrow_t *y, const uint8_t *new_key);
-static void generate_output(yarrow_t *y);
+static void generate_output_unlocked(yarrow_t *y);
 static int  estimate_entropy(yarrow_source_t *src, int64_t new_val);
 static void consume_bytes(yarrow_t *y, const uint8_t *buf, size_t len);
 static void read_seed_file(yarrow_t *y, const char *path);
@@ -26,105 +39,98 @@ static void read_seed_file(yarrow_t *y, const char *path);
 /* ── §5.1 Generation mechanism ─────────────────────────────────────────────── */
 
 /*
- * Increment the 128-bit counter (big-endian, matching original counterInc()).
- * We treat counter[15] as the least significant byte.
- */
-static void counter_inc(yarrow_t *y) {
-    for (int i = YARROW_BLOCK_SIZE - 1; i >= 0; i--) {
-        if (++y->counter[i] != 0)
-            break;
-    }
-}
-
-/*
- * Encrypt the current counter value into output_buf using AES-256.
- * libsodium doesn't expose raw AES-ECB, but crypto_stream_chacha20_xor
- * with a zero-message gives us a keystream block — same security model.
+ * Emit one YARROW_BLOCK_SIZE-byte keystream block into y->output_buf.
  *
- * We use ChaCha20 here because:
- *   a) libsodium's AES-GCM requires hardware acceleration (not always present)
- *   b) ChaCha20 is equally strong and faster in software
- *   c) The Yarrow spec says "a block cipher" — ChaCha20 in counter mode qualifies
+ * Key change from the original:
+ *   Before: counter_inc() mutated an in-place 16-byte array that doubled as
+ *           the nonce; it was zeroed on every rekey().
+ *   After:  y->block_counter is incremented unconditionally and encoded into
+ *           the `ic` (initial counter) argument of chacha20_xor_ic.  The
+ *           8-byte y->nonce is never touched after init.
  *
- * If you need strict AES, swap this for OpenSSL's EVP_EncryptUpdate in ECB mode.
- */
-/*
- * Internal unlocked version — called only when lock is already held.
- * Generates one block of output into y->output_buf.
+ * crypto_stream_chacha20_xor_ic signature (libsodium):
+ *   int crypto_stream_chacha20_xor_ic(
+ *       unsigned char *c,          // ciphertext out
+ *       const unsigned char *m,    // plaintext in  (zeros → pure keystream)
+ *       unsigned long long mlen,
+ *       const unsigned char *n,    // 8-byte nonce
+ *       uint64_t ic,               // initial block counter (little-endian)
+ *       const unsigned char *k);   // 32-byte key
  */
 static void generate_output_unlocked(yarrow_t *y) {
-    counter_inc(y);
+    /* Advance the block counter before use — never reuse a position. */
+    y->block_counter++;
 
     uint8_t zero_block[YARROW_BLOCK_SIZE] = {0};
-    crypto_stream_chacha20_xor(
+    crypto_stream_chacha20_xor_ic(
         y->output_buf,
         zero_block,
         YARROW_BLOCK_SIZE,
-        y->counter,
+        y->nonce,
+        y->block_counter,
         y->key
     );
 
     y->output_count++;
 
-    /* §5.1 rekey every Pg blocks — derive new key directly from output buffer
-       to provide forward secrecy, without recursive calls. */
+    /* §5.1  Rekey every Pg blocks for forward secrecy. */
     if (y->output_count >= YARROW_Pg) {
         y->output_count = 0;
+
+        /* Derive a new 32-byte key from the next two keystream blocks.
+         * Each block is YARROW_BLOCK_SIZE (64) bytes; we take the first
+         * 16 bytes of each to fill the 32-byte key.                      */
         uint8_t new_key[YARROW_KEY_SIZE] = {0};
 
-        /* Generate two more raw blocks to form the new 32-byte key */
         for (int k = 0; k < 2; k++) {
-            counter_inc(y);
-            uint8_t tmp_block[YARROW_BLOCK_SIZE] = {0};
-            uint8_t raw[YARROW_BLOCK_SIZE];
-            crypto_stream_chacha20_xor(raw, tmp_block, YARROW_BLOCK_SIZE,
-                                       y->counter, y->key);
-            memcpy(new_key + k * YARROW_BLOCK_SIZE, raw, YARROW_BLOCK_SIZE);
+            y->block_counter++;
+            uint8_t tmp_in[YARROW_KEY_SIZE / 2]  = {0};
+            uint8_t raw   [YARROW_KEY_SIZE / 2];
+            crypto_stream_chacha20_xor_ic(
+                raw,
+                tmp_in,
+                YARROW_KEY_SIZE / 2,
+                y->nonce,
+                y->block_counter,
+                y->key
+            );
+            memcpy(new_key + k * (YARROW_KEY_SIZE / 2), raw, YARROW_KEY_SIZE / 2);
             sodium_memzero(raw, sizeof(raw));
         }
+
         rekey(y, new_key);
         sodium_memzero(new_key, sizeof(new_key));
-        return; /* fresh state installed; caller will regenerate output */
+        /* Note: rekey() does NOT reset block_counter — that is the whole fix.
+         * The caller re-invokes generate_output_unlocked() on next fetch.   */
     }
 }
 
-static void generate_output(yarrow_t *y) {
-    generate_output_unlocked(y);
-}
-
 /*
- * Rekey the generator: install new_key, reset counter by encrypting
- * the all-zero string (mirrors Java's rekey() exactly).
+ * Install a new key.
+ *
+ * Key change from the original:
+ *   The old rekey() reset the counter to Encrypt(key, 0...0) which
+ *   re-derived nonce bytes from the key, enabling collisions.
+ *
+ *   The new rekey() only updates y->key and marks output_buf stale.
+ *   y->nonce and y->block_counter are deliberately left untouched.
  */
 static void rekey(yarrow_t *y, const uint8_t *new_key) {
     memcpy(y->key, new_key, YARROW_KEY_SIZE);
-
-    /* Reset counter = Encrypt(key, 0...0) */
-    uint8_t zero[YARROW_BLOCK_SIZE] = {0};
-    uint8_t zero_nonce[8] = {0};
-    crypto_stream_chacha20_xor(
-        y->counter,
-        zero,
-        YARROW_BLOCK_SIZE,
-        zero_nonce,
-        y->key
-    );
-
-    y->fetch_cursor = YARROW_BLOCK_SIZE; /* force fresh generate on next fetch */
+    /* Invalidate the output buffer so the next fetch triggers a fresh block. */
+    y->fetch_cursor = YARROW_BLOCK_SIZE;
 }
 
 /* ── §5.2 Entropy accumulator ───────────────────────────────────────────────── */
 
 /*
  * Third-order delta entropy estimator — direct port of Freenet's
- * estimateEntropy(). Watches how quickly values change to bound
- * the real entropy conservatively.
+ * estimateEntropy().  Unchanged from the original.
  */
 static int estimate_entropy(yarrow_source_t *src, int64_t new_val) {
     int delta  = (int)(new_val - src->last_val);
     int delta2 = delta - src->last_delta;
     src->last_delta = delta;
-
     int delta3 = delta2 - src->last_delta2;
     src->last_delta2 = delta2;
 
@@ -132,31 +138,24 @@ static int estimate_entropy(yarrow_source_t *src, int64_t new_val) {
     if (delta2 < 0) delta2 = -delta2;
     if (delta3 < 0) delta3 = -delta3;
 
-    /* Take the minimum absolute delta across all three orders */
     if (delta > delta2) delta = delta2;
     if (delta > delta3) delta = delta3;
 
-    /* Round down 1 bit on principle; cap at 12 bits */
     delta >>= 1;
-    delta &= (1 << 12) - 1;
+    delta  &= (1 << 12) - 1;
 
-    /* Smear MSB right to build an n-bit mask */
     delta |= delta >> 8;
     delta |= delta >> 4;
     delta |= delta >> 2;
     delta |= delta >> 1;
-
-    /* Remove one bit → logarithm */
     delta >>= 1;
 
-    /* Popcount (Hamming weight) */
     delta -= (delta >> 1) & 0x555;
     delta  = (delta & 0x333) + ((delta >> 2) & 0x333);
     delta += (delta >> 4);
     delta += (delta >> 8);
 
     src->last_val = new_val;
-
     return delta & 15;
 }
 
@@ -165,63 +164,46 @@ static int estimate_entropy(yarrow_source_t *src, int64_t new_val) {
  * Alternates fast/slow on each call (mirrors Java's consumeBytes).
  */
 static void consume_bytes(yarrow_t *y, const uint8_t *buf, size_t len) {
-    if (y->fast_select) {
+    if (y->fast_select)
         crypto_hash_sha256_update(&y->fast_pool, buf, len);
-    } else {
+    else
         crypto_hash_sha256_update(&y->slow_pool, buf, len);
-    }
     y->fast_select = !y->fast_select;
 }
 
 /* ── §5.3 Reseed mechanism ──────────────────────────────────────────────────── */
 
-/*
- * Fast pool reseed: iterated hash chain of Pt=5 rounds.
- * Direct port of Freenet's fast_pool_reseed().
- */
 static void fast_pool_reseed(yarrow_t *y) {
-    /* Snapshot the fast pool digest without destroying state */
     crypto_hash_sha256_state pool_copy = y->fast_pool;
     uint8_t v0[YARROW_HASH_SIZE];
     crypto_hash_sha256_final(&pool_copy, v0);
 
-    /* Re-init pool for future entropy */
     crypto_hash_sha256_init(&y->fast_pool);
 
     uint8_t vi[YARROW_HASH_SIZE];
     memcpy(vi, v0, YARROW_HASH_SIZE);
 
-    /* vPt = H(H(...H(v0 || v0 || 0) || v0 || 1)...) for Pt rounds */
     for (uint8_t i = 0; i < YARROW_Pt; i++) {
         crypto_hash_sha256_state round;
         crypto_hash_sha256_init(&round);
         crypto_hash_sha256_update(&round, vi, YARROW_HASH_SIZE);
         crypto_hash_sha256_update(&round, v0, YARROW_HASH_SIZE);
-        crypto_hash_sha256_update(&round, &i, 1);
+        crypto_hash_sha256_update(&round, &i,  1);
         crypto_hash_sha256_final(&round, vi);
     }
 
-    /* vi is now vPt — use it as the new key (truncate/pad to key size) */
-    rekey(y, vi);
-
+    rekey(y, vi);   /* installs vi as new key; block_counter keeps counting */
     sodium_memzero(v0, sizeof(v0));
     sodium_memzero(vi, sizeof(vi));
     y->fast_entropy = 0;
 }
 
-/*
- * Slow pool reseed: fold slow pool hash into fast pool, then fast reseed.
- * Also resets per-source contribution counters.
- */
 static void slow_pool_reseed(yarrow_t *y) {
     crypto_hash_sha256_state pool_copy = y->slow_pool;
     uint8_t slow_hash[YARROW_HASH_SIZE];
     crypto_hash_sha256_final(&pool_copy, slow_hash);
 
-    /* Re-init slow pool */
     crypto_hash_sha256_init(&y->slow_pool);
-
-    /* Fold slow hash into fast pool */
     crypto_hash_sha256_update(&y->fast_pool, slow_hash, YARROW_HASH_SIZE);
     sodium_memzero(slow_hash, sizeof(slow_hash));
 
@@ -241,28 +223,37 @@ int yarrow_init(yarrow_t *y, const char *seedfile) {
     memset(y, 0, sizeof(*y));
     pthread_mutex_init(&y->lock, NULL);
 
-    /* Init both entropy pools */
     crypto_hash_sha256_init(&y->fast_pool);
     crypto_hash_sha256_init(&y->slow_pool);
+    y->fast_select = true;
+    y->fetch_cursor = YARROW_BLOCK_SIZE;  /* trigger generate on first use */
 
-    y->fast_select  = true;
-    y->fetch_cursor = YARROW_BLOCK_SIZE; /* trigger generate on first use */
+    /* Key: random 32 bytes. */
+    randombytes_buf(y->key, YARROW_KEY_SIZE);
 
-    /* Seed key and counter from libsodium's secure random */
-    randombytes_buf(y->key,     YARROW_KEY_SIZE);
-    randombytes_buf(y->counter, YARROW_BLOCK_SIZE);
+    /*
+     * Nonce: random 8 bytes, set once here, NEVER changed again.
+     * This is the heart of the fix: a stable, unique nonce per yarrow_t
+     * instance means that the monotonically-increasing block_counter is
+     * the sole source of position uniqueness.
+     */
+    randombytes_buf(y->nonce, YARROW_NONCE_SIZE);
 
-    /* Record seedfile path */
+    /*
+     * block_counter: start at 0.  The first generate_output_unlocked() call
+     * will increment it to 1 before any keystream bytes are produced, so
+     * position 0 is never used (matches standard practice of 1-based IC).
+     */
+    y->block_counter = 0;
+
     if (seedfile) {
         strncpy(y->seedfile, seedfile, sizeof(y->seedfile) - 1);
         y->has_seedfile = true;
         read_seed_file(y, seedfile);
     }
 
-    /* Pull in OS entropy */
     yarrow_seed_from_os(y, false);
 
-    /* Force initial reseed so startup entropy is mixed in */
     pthread_mutex_lock(&y->lock);
     fast_pool_reseed(y);
     slow_pool_reseed(y);
@@ -296,7 +287,6 @@ int yarrow_accept_entropy(yarrow_t *y, int source_id,
     int actual    = (entropy_bits < estimated ? entropy_bits : estimated);
     if (actual > 32) actual = 32;
 
-    /* Feed data bytes into alternating pool */
     uint8_t buf[8];
     for (int i = 0; i < 8; i++)
         buf[i] = (uint8_t)(data >> (i * 8));
@@ -316,14 +306,11 @@ int yarrow_accept_entropy(yarrow_t *y, int source_id,
     } else {
         y->slow_entropy += actual;
         src->contributed += actual;
-
         if (y->slow_entropy >= YARROW_SLOW_THRESHOLD * 2) {
-            /* Count sources that have contributed > SLOW_THRESHOLD bits */
             int qualifying = 0;
-            for (int i = 0; i < y->source_count; i++) {
+            for (int i = 0; i < y->source_count; i++)
                 if (y->sources[i].contributed > YARROW_SLOW_THRESHOLD)
                     qualifying++;
-            }
             if (qualifying >= YARROW_SLOW_K) {
                 slow_pool_reseed(y);
                 did_reseed = true;
@@ -333,7 +320,6 @@ int yarrow_accept_entropy(yarrow_t *y, int source_id,
 
     pthread_mutex_unlock(&y->lock);
 
-    /* Write seed file outside lock (file I/O is slow, mirrors Freenet comment) */
     if (did_reseed && y->has_seedfile)
         yarrow_write_seed(y, false);
 
@@ -354,13 +340,13 @@ void yarrow_next_bytes(yarrow_t *y, uint8_t *buf, size_t len) {
     while (written < len) {
         if (y->fetch_cursor >= YARROW_BLOCK_SIZE) {
             y->fetch_cursor = 0;
-            generate_output(y);
+            generate_output_unlocked(y);
         }
         size_t available = YARROW_BLOCK_SIZE - y->fetch_cursor;
-        size_t take      = (len - written < available) ? (len - written) : available;
+        size_t take = (len - written < available) ? (len - written) : available;
         memcpy(buf + written, y->output_buf + y->fetch_cursor, take);
         y->fetch_cursor += (int)take;
-        written         += take;
+        written += take;
     }
 
     pthread_mutex_unlock(&y->lock);
@@ -402,7 +388,6 @@ static void read_seed_file(yarrow_t *y, const char *path) {
 void yarrow_write_seed(yarrow_t *y, bool force) {
     if (!y->has_seedfile) return;
 
-    /* Rate-limit to once per hour unless forced */
     static time_t last_write = 0;
     time_t now = time(NULL);
     if (!force && (now - last_write) < 3600) return;
@@ -423,28 +408,20 @@ void yarrow_write_seed(yarrow_t *y, bool force) {
 void yarrow_seed_from_os(yarrow_t *y, bool can_block) {
     uint8_t buf[32];
 
-    /* /dev/hwrng if available */
     FILE *hwrng = fopen("/dev/hwrng", "rb");
     if (hwrng) {
-        if (fread(buf, 1, sizeof(buf), hwrng) == sizeof(buf))
-            consume_bytes(y, buf, sizeof(buf));
-        if (fread(buf, 1, sizeof(buf), hwrng) == sizeof(buf))
-            consume_bytes(y, buf, sizeof(buf));
+        if (fread(buf, 1, sizeof(buf), hwrng) == sizeof(buf)) consume_bytes(y, buf, sizeof(buf));
+        if (fread(buf, 1, sizeof(buf), hwrng) == sizeof(buf)) consume_bytes(y, buf, sizeof(buf));
         fclose(hwrng);
     }
 
-    /* /dev/urandom — non-blocking, always try */
     FILE *urandom = fopen("/dev/urandom", "rb");
     if (urandom) {
-        if (fread(buf, 1, sizeof(buf), urandom) == sizeof(buf))
-            consume_bytes(y, buf, sizeof(buf));
-        if (fread(buf, 1, sizeof(buf), urandom) == sizeof(buf))
-            consume_bytes(y, buf, sizeof(buf));
+        if (fread(buf, 1, sizeof(buf), urandom) == sizeof(buf)) consume_bytes(y, buf, sizeof(buf));
+        if (fread(buf, 1, sizeof(buf), urandom) == sizeof(buf)) consume_bytes(y, buf, sizeof(buf));
         fclose(urandom);
     }
 
-    /* /dev/random — use O_NONBLOCK so we never hang;
-       on Linux since kernel 5.6 this is equivalent to /dev/urandom anyway */
     {
         int fd = open("/dev/random", O_RDONLY | O_NONBLOCK);
         if (fd >= 0) {
@@ -452,14 +429,12 @@ void yarrow_seed_from_os(yarrow_t *y, bool can_block) {
             if (n > 0) consume_bytes(y, buf, (size_t)n);
             close(fd);
         }
-        (void)can_block; /* parameter kept for API compatibility */
+        (void)can_block;
     }
 
-    /* libsodium's own CSPRNG as a fallback/supplement */
     randombytes_buf(buf, sizeof(buf));
     consume_bytes(y, buf, sizeof(buf));
 
-    /* Timing jitter */
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     consume_bytes(y, (uint8_t *)&ts, sizeof(ts));
@@ -470,8 +445,9 @@ void yarrow_seed_from_os(yarrow_t *y, bool can_block) {
 void yarrow_destroy(yarrow_t *y) {
     pthread_mutex_lock(&y->lock);
     sodium_memzero(y->key,        sizeof(y->key));
-    sodium_memzero(y->counter,    sizeof(y->counter));
+    sodium_memzero(y->nonce,      sizeof(y->nonce));
     sodium_memzero(y->output_buf, sizeof(y->output_buf));
+    y->block_counter = 0;
     pthread_mutex_unlock(&y->lock);
     pthread_mutex_destroy(&y->lock);
     memset(y, 0, sizeof(*y));
