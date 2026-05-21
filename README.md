@@ -2,9 +2,12 @@
 
 ```
 gcc -O2 -o yarrow_test yarrow.c yarrow_test.c -lsodium -lpthread
-./yarrow_test sample
+./yarrow_test             # runs all modes except randomness and hashes
+./yarrow_test hashes      # common_hashes.h demo
 ./yarrow_test latency
-./yarrow_test randomness 1024 | dieharder -a -g 200
+./yarrow_test sample
+./yarrow_test entropy
+./yarrow_test randomness 1024
 ```
 
 The original code stored both the ChaCha20 nonce and the block position in a single 16-byte `counter[]` array and reset it inside `rekey()`. After each reseed, the counter went back to `Encrypt(key, 0...0)`, so it could revisit the same counter positions with a different key — and ChaCha20's security model requires the `(nonce, block_position)` pair to be globally unique, not just unique within one key's lifetime.
