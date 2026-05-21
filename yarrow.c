@@ -379,19 +379,15 @@ static void read_seed_file(yarrow_t *y, const char *path) {
         yarrow_accept_entropy(y, src, (int64_t)val, 64);
     }
     fclose(f);
-
-    pthread_mutex_lock(&y->lock);
-    fast_pool_reseed(y);
-    pthread_mutex_unlock(&y->lock);
 }
 
 void yarrow_write_seed(yarrow_t *y, bool force) {
     if (!y->has_seedfile) return;
 
-    static time_t last_write = 0;
     time_t now = time(NULL);
-    if (!force && (now - last_write) < 3600) return;
-    last_write = now;
+    if (!force && (now - y->last_seed_write) < 3600)
+        return;
+    y->last_seed_write = now;
 
     FILE *f = fopen(y->seedfile, "wb");
     if (!f) return;

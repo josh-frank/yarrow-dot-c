@@ -102,6 +102,7 @@ typedef struct {
     /* Seed file */
     char seedfile[256];
     bool has_seedfile;
+    time_t last_seed_write;
 
     pthread_mutex_t lock;
 } yarrow_t;

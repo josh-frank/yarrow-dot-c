@@ -26,3 +26,11 @@ A few secondary changes fell out of this:
 - `YARROW_BLOCK_SIZE` updated from 16 (AES block) to 64 (ChaCha20 block), since the original was accidentally using the wrong block size for ChaCha20 — it was only XOR-ing 16 bytes per call when ChaCha20 produces 64.
 - The rekey key-derivation loop adjusted accordingly (takes 16 bytes from each of 2 blocks to fill 32 bytes, avoiding a full 128-byte keystream draw just for a new key).
 - `yarrow_destroy()` now also zeroes `nonce` and `block_counter`.
+
+<!--
+## Bugs
+
+**`static time_t last_write` in `yarrow_write_seed`** — Easy fix: add `time_t last_seed_write;` to `yarrow_t` in the header, initialize it to `0` in `yarrow_init`, and replace the static local with `y->last_seed_write`. Then it's per-instance and naturally protected by whatever serialization the caller provides around `yarrow_write_seed`.
+
+**Double reseed on init with seedfile** — `read_seed_file` ends with a locked `fast_pool_reseed`, then `yarrow_init` immediately does another locked `fast_pool_reseed` + `slow_pool_reseed`. The simplest fix is to just drop the `fast_pool_reseed` at the end of `read_seed_file` — the forced double-reseed at the bottom of `yarrow_init` already covers it unconditionally, seedfile or not.
+-->
