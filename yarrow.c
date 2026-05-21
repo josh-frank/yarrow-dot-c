@@ -291,9 +291,9 @@ int yarrow_accept_entropy(yarrow_t *y, int source_id,
     for (int i = 0; i < 8; i++)
         buf[i] = (uint8_t)(data >> (i * 8));
 
-    y->fast_select = !y->fast_select;
-    bool went_to_fast = y->fast_select;
-    consume_bytes(y, buf, 8);
+    // Remove the manual toggle. Just peek at fast_select before the call.
+    bool went_to_fast = y->fast_select; // fast_select is true → next consume goes to fast pool
+    consume_bytes(y, buf, 8);           // consume_bytes routes, then flips fast_select
 
     bool did_reseed = false;
 

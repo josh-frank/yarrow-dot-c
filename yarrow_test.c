@@ -151,9 +151,8 @@ static void demo_hashes(yarrow_t *y) {
     printf("  yarrow_random_hex(32):  %s\n", hex32);
     printf("  yarrow_random_hex(16):  %s\n", hex16);
 
-    /* Base64url tokens */
-    char b64_32[SODIUM_BASE64_ENCODED_LEN(32, sodium_base64_VARIANT_URLSAFE_NO_PADDING)];
-    char b64_24[SODIUM_BASE64_ENCODED_LEN(24, sodium_base64_VARIANT_URLSAFE_NO_PADDING)];
+    char b64_32[64]; /* ceil(32/3)*4 + 1 = 44, 64 is plenty */
+    char b64_24[48]; /* ceil(24/3)*4 + 1 = 33, 48 is plenty */
     yarrow_random_base64url(y, b64_32, 32);
     yarrow_random_base64url(y, b64_24, 24);
     printf("  yarrow_random_base64url(32): %s\n", b64_32);
